@@ -1,7 +1,8 @@
 import os
 import json
 
-folder = r'/data/dataset/dev/aac'
+#folder = r'/data/dataset/dev/aac'
+folder = r'/Users/dirceusilva/Documentos/BaseDados/VoxCeleb2/dev/aac'
 path_spkid = []
 for i,subfolder in enumerate(os.listdir(folder)):
     for sf in os.listdir(os.path.join(folder, subfolder)):
