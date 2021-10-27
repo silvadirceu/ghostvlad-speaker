@@ -2,87 +2,131 @@ from __future__ import division
 from __future__ import print_function
 import json
 import multiprocessing as mp
-import numpy as np
+
 import os
 import random
-import librosa
 import numpy as np
-from pydub import AudioSegment
-import io
+import psutil
+import deepdish as dd
+from joblib import Parallel, delayed
 
-# load from m4a, the format of voxcele2 dataset
-def load_m4a(vid_path, sr):
-    audio = AudioSegment.from_file(vid_path, "mp4")
-    audio = audio.set_frame_rate(sr)
-    audio = audio.set_channels(1)
-    audio = audio.set_sample_width(2)
-    buf = io.BytesIO()
-    audio.export(buf, format='s16le')
-    wav = np.frombuffer(buf.getbuffer(), np.int16)
-    wav = np.array(wav/32768.0, dtype=np.float32)
+from load_audio import load_data
+from utils import log
 
-    intervals = librosa.effects.split(wav, top_db=20)
-    wav_output = []
-    for sliced in intervals:
-      wav_output.extend(wav[sliced[0]:sliced[1]])
-    wav_output = np.array(wav_output)
-    return wav_output
+import time
 
-# load from wav
-def load_wav(vid_path, sr):
-    wav, sr_ret = librosa.load(vid_path, sr=sr)
-    assert sr_ret == sr
+_LOG_FILE_PATH = "extractor.log"
+_LOG_FILE = log(_LOG_FILE_PATH)
+_ERRORS = list()
 
-    intervals = librosa.effects.split(wav, top_db=20)
-    wav_output = []
-    for sliced in intervals:
-      wav_output.extend(wav[sliced[0]:sliced[1]])
-    wav_output = np.array(wav_output)
-    return wav_output
 
-def lin_spectogram_from_wav(wav, hop_length, win_length, n_fft=1024):
-    linear = librosa.stft(wav, n_fft=n_fft, win_length=win_length, hop_length=hop_length) # linear spectrogram
-    return linear.T
+def feature_path(audio_path, feature_dir):
+    path = audio_path.split('/')
+    filename = path[-1].split(".")[0]
+    session = path[-2]
+    speaker_id = path[-3]
 
-def load_data(path, sr=16000, win_length=400, hop_length=160, n_fft=512, rand_duration=2500, is_training=True):
-    try:
-        if(path.endswith('.wav')):
-            wav = load_wav(path, sr=sr)
-        elif(path.endswith('.m4a')):
-            wav = load_m4a(path, sr=sr)
+    work_dir = os.path.join(feature_dir,speaker_id,session)
+
+    filepath = os.path.join(work_dir, filename + '.h5')
+
+    return work_dir, filepath
+
+
+def split_list_with_N_elements(seq,n):
+    #spli a list in sublists with n elements + the reminder
+
+    newlist = [seq[i * n:(i + 1) * n] for i in range((len(seq) + n - 1) // n )]
+    return newlist
+
+class FeatureExtractor(object):
+
+    def __init__(self, data_json, feature_dir=None, batch_size=32, sample_rate=16000,
+                 min_duration=600, max_duration=2500, mode="train",
+                 n_workers=-1, parallel=True,
+                 save_features=True):
+        """
+        Args:
+            data_json : json format file with speech data.
+                        'path', the path of the wave file.
+                        'spkid', the speaker's identity in int.
+            batch_size : Size of the batches for training.
+            sample_rate : Rate to resample audio prior to feature computation.
+            min_duration : Minimum length of audio sample in milliseconds.
+            max_duration : Maximum length of audio sample in milliseconds.
+        """
+
+        self.params ={"sample_rate": sample_rate,
+                      "min_duration": min_duration,
+                      "max_duration": max_duration,
+                      "feature_dir": feature_dir,
+                      "mode": mode,
+                      "save_feature": save_features,
+                      "parallel": parallel,
+                      "batch_size": batch_size}
+
+        with open(data_json, 'r') as fid:
+            self.data = json.load(fid)
+
+        if n_workers == -1:
+            self.params["num_cpus"] = psutil.cpu_count(logical=False)
         else:
-            print("!!! Not supported audio format.")
-            return None
-    except Exception as e:
-        print("Exception happened when load_data('{}'): {}".format(path, str(e)))
-        return None
+            self.params["num_cpus"] = n_workers
 
-    linear_spect = lin_spectogram_from_wav(wav, hop_length, win_length, n_fft)
-    mag, _ = librosa.magphase(linear_spect)  # magnitude
-    mag_T = mag.T
-    freq, time = mag_T.shape
-    spec_mag = mag_T
 
-    if(is_training):
-        randSpec = rand_duration//(1000//(sr//hop_length))  # random duration in spectrum
-        if(randSpec>=time): # wav is too short, use the whole wav.
-            spec_mag = mag_T
+    def compute_features(self):
+
+        if self.params["parallel"]:
+
+            #batches = [self.data[i:i + self.params["batch_size"]]
+            #           for i in range(0, len(self.data) - self.params["batch_size"] + 1, self.params["batch_size"])]
+
+            batches = split_list_with_N_elements(self.data, self.params["batch_size"])
+
+            #batches = np.array_split(self.data, self.params["batch_size"])
+            start = time.time()
+
+            Parallel(n_jobs=self.params["num_cpus"], verbose=100)(
+                delayed(self._extractor)(cpath, self.params) for cpath in batches)
+
+            stop=time.time()
+            print("time: ", stop-start)
+
         else:
-            randStart = np.random.randint(0, time-randSpec)
-            spec_mag = mag_T[:, randStart:randStart+randSpec]
+            start = time.time()
+            self._extractor(self.data[:320], self.params)
+            stop=time.time()
+            print("time: ", stop-start)
 
-        # preprocessing, subtract mean, divided by time-wise var
-        mu = np.mean(spec_mag, 0, keepdims=True)
-        std = np.std(spec_mag, 0, keepdims=True)
-        spec_mag = (spec_mag - mu) / (std + 1e-5)
+    def _extractor(self, list_path, params):
 
-    else:
-        # preprocessing, subtract mean, divided by time-wise var
-        mu = np.mean(spec_mag, 0, keepdims=True)
-        std = np.std(spec_mag, 0, keepdims=True)
-        spec_mag = (spec_mag - mu) / (std + 1e-5)
+        rand_duration = np.random.randint(params["min_duration"], params["max_duration"])
+        utterance_spec = None
 
-    return spec_mag
+        for file in list_path:
+
+            audio_path = file["path"]
+
+            try:
+                utterance_spec = load_data(audio_path,
+                                           sr=params["sample_rate"],
+                                           mode=params["mode"])
+            except:
+                _ERRORS.append(audio_path)
+                _LOG_FILE.debug("Error: skipping computing features for audio file --%s-- " % audio_path)
+                utterance_spec = None
+
+            work_dir, filepath = feature_path(audio_path, params["feature_dir"])
+
+            if utterance_spec is not None:
+                try:
+                    if not os.path.exists(work_dir):
+                        os.makedirs(work_dir)
+
+                    dd.io.save(filepath, utterance_spec)
+                except:
+                    _ERRORS.append(filepath)
+                    _LOG_FILE.debug("Error: saving features for audio file --%s-- " % filepath)
 
 
 class AudioProducer(object):
